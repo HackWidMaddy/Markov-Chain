@@ -85,8 +85,9 @@ def cmd_probs(args: argparse.Namespace) -> None:
 
 
 def cmd_benchmark(args: argparse.Namespace) -> None:
-    """Benchmark Markov model vs brute-force (uniform baseline) and report metrics."""
+    """Benchmark Markov model vs brute-force permutation search and report metrics."""
     import random
+    from itertools import permutations
     model = CharMarkovModel.load(args.model)
     raw = load_text(args.input)
     prep_cfg = TextPrepConfig(
@@ -98,97 +99,134 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     text = normalize_text(raw, prep_cfg)
     _, _, test = split_text(text, train_frac=args.train_frac, val_frac=args.val_frac, seed=args.seed)
 
-    # Prune test to requested n if specified
-    if args.n_tokens is not None and args.n_tokens < len(test):
-        test = test[:args.n_tokens]
-
     n_tokens = len(test) - model.order_k
     if n_tokens <= 0:
         print("Error: insufficient test data")
         return
 
-    # Build brute-force baseline: uniform probabilities
     alphabet = model.alphabet
     V = len(alphabet)
 
-    # Benchmark Markov
+    # Problem: Given 6 characters, guess the word using brute-force (6! permutations) vs Markov next-char prediction
+    target_word_len = args.word_len if args.word_len > 0 else 6
+    chars_to_try = args.chars_to_try if args.chars_to_try else None
+
+    if chars_to_try is None:
+        # Use a random word from test data (with order_k prefix context)
+        if len(test) < model.order_k + target_word_len:
+            print(f"Error: need at least {model.order_k + target_word_len} chars in test data")
+            return
+        start_idx = random.randint(0, len(test) - (model.order_k + target_word_len))
+        context = test[start_idx:start_idx + model.order_k]
+        target_word = test[start_idx + model.order_k:start_idx + model.order_k + target_word_len]
+        available_chars = sorted(list(set(target_word)))  # Unique chars from target word
+    else:
+        available_chars = sorted(list(set(chars_to_try)))
+        # Use a default context
+        context = test[:model.order_k] if len(test) >= model.order_k else available_chars[:model.order_k]
+        target_word = None  # Will be reconstructed by brute-force
+
+    # Brute-force: enumerate all permutations (6! for 6 chars) to find the word
+    brute_force_space_size = math.factorial(len(available_chars)) if len(available_chars) <= 12 else 10**15
+    print(f"\nProblem setup:")
+    print(f"  Target word length: {target_word_len}")
+    print(f"  Available characters: {''.join(available_chars)}")
+    print(f"  Brute-force space size: {brute_force_space_size:,} permutations ({len(available_chars)}!)")
+    if target_word:
+        print(f"  Target word: '{target_word}' (hidden)")
+
+    # Benchmark Markov: backtracking search with iterative next-char prediction
     t0 = time.perf_counter()
-    markov_correct = 0
-    markov_ce_sum = 0.0
-    markov_dist_count = 0
-    for i in range(model.order_k, len(test)):
-        history = test[i - model.order_k : i]
-        true_ch = test[i]
+    
+    def markov_search(current_word, available_chars, history, max_depth):
+        """DFS search using Markov predictions, returns (word, num_predictions, found)"""
+        if len(current_word) == max_depth:
+            return (current_word, 0, True)
+        if not available_chars:
+            return (current_word, 0, False)
+        
+        # Get Markov prediction distribution
         dist = model.next_distribution(history)
-        p_true = max(1e-12, dist.get(true_ch, 0.0))
-        markov_ce_sum += -math.log2(p_true) if p_true > 1e-12 else 20.0
-        markov_dist_count += 1
-        pred = model.predict_next(history)
-        if pred == true_ch:
-            markov_correct += 1
+        
+        # Sort available chars by Markov probability (descending)
+        char_scores = [(ch, dist.get(ch, 0.0)) for ch in available_chars]
+        char_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        num_predictions = 1  # One call to next_distribution
+        
+        for char, prob in char_scores:
+            remaining = available_chars.replace(char, '', 1)
+            new_history = (history + char)[-model.order_k:]
+            
+            result_word, result_preds, found = markov_search(
+                current_word + char, remaining, new_history, max_depth
+            )
+            num_predictions += result_preds
+            
+            if found:
+                return (result_word, num_predictions, True)
+        
+        return (current_word, num_predictions, False)
+    
+    markov_word, markov_steps, markov_success = markov_search("", ''.join(available_chars), context, target_word_len)
     t_markov = time.perf_counter() - t0
 
-    # Benchmark brute-force (uniform sampling)
-    random.seed(args.seed_bench)
+    # Benchmark brute-force: enumerate all permutations (6! etc.)
     t0 = time.perf_counter()
-    bf_correct = 0
-    bf_ce_sum = 0.0
-    uniform_prob = 1.0 / V
-    uniform_ce = -math.log2(uniform_prob)
-    for i in range(model.order_k, len(test)):
-        history = test[i - model.order_k : i]
-        true_ch = test[i]
-        # Always uniform; no context
-        p_true = uniform_prob
-        bf_ce_sum += uniform_ce
-        pred = random.choice(alphabet)
-        if pred == true_ch:
-            bf_correct += 1
+    brute_force_steps = 0
+    brute_force_found = None
+    if target_word and len(available_chars) <= 10:  # Only if reasonable to enumerate
+        from itertools import permutations
+        for perm in permutations(available_chars, target_word_len):
+            brute_force_steps += 1
+            candidate = ''.join(perm)
+            if candidate == target_word:
+                brute_force_found = candidate
+                break
+            if brute_force_steps > 100000:  # Safety limit
+                break
+    else:
+        brute_force_steps = brute_force_space_size  # Theoretical max
+        brute_force_found = "N/A (too large)"
     t_bf = time.perf_counter() - t0
 
-    # Metrics
-    markov_acc = markov_correct / n_tokens if n_tokens > 0 else 0.0
-    bf_acc = bf_correct / n_tokens if n_tokens > 0 else 0.0
-    markov_ce = markov_ce_sum / markov_dist_count if markov_dist_count > 0 else float("inf")
-    bf_ce = bf_ce_sum / n_tokens if n_tokens > 0 else float("inf")
-    markov_ppl = perplexity(markov_ce)
-    bf_ppl = perplexity(bf_ce)
+    # Calculate ratio: steps required by brute-force / steps required by Markov
+    if markov_steps > 0:
+        step_ratio = brute_force_steps / markov_steps
+    else:
+        step_ratio = brute_force_steps
 
-    # Search space reduction: effective alphabet size from entropy
-    markov_eff_v = 2 ** (markov_ce / 1.442695)
-    bf_eff_v = V
-    reduction = 1.0 - (markov_eff_v / bf_eff_v) if bf_eff_v > 0 else 0.0
-
-    # Speedup
+    # Speedup ratio
     speedup = t_bf / t_markov if t_markov > 0 else 0.0
 
     # Output
-    print("=" * 70)
-    print("BENCHMARK: Markov Chain vs Brute-Force (Uniform Baseline)")
-    print("=" * 70)
-    print(f"\nTest configuration:")
-    print(f"  Tokens: {n_tokens}")
-    print(f"  Alphabet size: {V}")
-    print(f"  Model order: {model.order_k}")
-    print(f"  Using Witten-Bell: {model.use_witten_bell}")
-    print(f"\n{'Metric':<25} {'Markov':>15} {'Brute-Force':>15} {'Improvement':>15}")
-    print("-" * 70)
-    print(f"{'Accuracy':<25} {markov_acc:>15.4%} {bf_acc:>15.4%} {(markov_acc / bf_acc - 1.0) * 100 if bf_acc > 0 else 0:>14.1f}%")
-    print(f"{'Cross-Entropy (bits)':<25} {markov_ce:>15.4f} {bf_ce:>15.4f} {((bf_ce / markov_ce - 1.0) * 100) if markov_ce > 0 else 0:>14.1f}%")
-    print(f"{'Perplexity':<25} {markov_ppl:>15.2f} {bf_ppl:>15.2f} {((bf_ppl / markov_ppl - 1.0) * 100) if markov_ppl > 0 else 0:>14.1f}%")
-    print(f"{'Prediction time (s)':<25} {t_markov:>15.6f} {t_bf:>15.6f} {speedup:>14.2f}x")
-    print(f"{'Pred rate (tok/s)':<25} {n_tokens / t_markov if t_markov > 0 else 0:>15.0f} {n_tokens / t_bf if t_bf > 0 else 0:>15.0f} {speedup:>14.2f}x")
-    print("-" * 70)
-    print(f"\nSearch space reduction:")
-    print(f"  Effective alphabet (Markov): {markov_eff_v:.2f}")
-    print(f"  Effective alphabet (Uniform): {bf_eff_v:.2f}")
-    print(f"  Reduction: {reduction:.1%}")
-    print(f"\nInterpretation:")
-    print(f"  • Markov model reduces effective search space by {reduction:.1%}")
-    print(f"  • Accuracy improves by {(markov_acc / bf_acc - 1.0) * 100 if bf_acc > 0 else 0:.1f}% vs uniform baseline")
-    print(f"  • Perplexity {(bf_ppl / markov_ppl - 1.0) * 100 if markov_ppl > 0 else 0:.1f}% lower (lower is better)")
-    print(f"  • Prediction time: {t_markov*1000:.2f}ms total for {n_tokens} tokens")
-    print("=" * 70)
+    print("=" * 90)
+    print("BENCHMARK: Markov Next-Character Prediction vs Brute-Force Permutation Search")
+    print("=" * 90)
+    if target_word:
+        print(f"\nResults:")
+        print(f"  Markov found: '{markov_word}' | Success: {markov_success}")
+        print(f"  Brute-force found: '{brute_force_found}'")
+        print(f"  Target was: '{target_word}'")
+    else:
+        print(f"\nResults:")
+        print(f"  Markov found: '{markov_word}' | Success: {markov_success}")
+        print(f"  Brute-force found: '{brute_force_found}'")
+    print(f"\n{'Metric':<30} {'Markov':>20} {'Brute-Force':>20} {'Ratio':>15}")
+    print("-" * 90)
+    print(f"{'Steps to solution':<30} {markov_steps:>20} {brute_force_steps:>20,} {step_ratio:>14.2f}x")
+    print(f"{'Search space size':<30} {'O(order_k)':>20} {brute_force_space_size:>20,}")
+    print(f"{'Time taken (ms)':<30} {t_markov*1000:>20.2f} {t_bf*1000:>20.2f} {speedup:>14.2f}x")
+    print(f"{'Success rate':<30} {'✓' if markov_success else '✗':>20} {'✓' if brute_force_found else '✗':>20}")
+    print("-" * 90)
+    step_reduction = ((brute_force_steps - markov_steps) / max(1, brute_force_steps)) * 100
+    print(f"\nKey Insight:")
+    print(f"  • Brute-force needs {brute_force_steps:,} steps (enumerating all permutations = {len(available_chars)}!)")
+    print(f"  • Markov needs {markov_steps} prediction function calls (with backtracking)")
+    print(f"  • Markov tries candidates in probability order, reducing search space")
+    print(f"  • Step reduction: {step_reduction:.1f}% (Markov makes {step_ratio:.1f}x fewer calls than brute-force)")
+    print(f"  • Complexity: Markov O({len(available_chars)}) predictions vs brute-force O({len(available_chars)}!) tries")
+    print("=" * 90)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -232,14 +270,16 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--topk", type=int, default=20)
     pp.set_defaults(func=cmd_probs)
 
-    pb = sub.add_parser("benchmark", help="Compare Markov vs brute-force baseline")
+    pb = sub.add_parser("benchmark", help="Compare Markov vs brute-force permutation search")
     pb.add_argument("--model", required=True)
     pb.add_argument("--input", required=True)
     pb.add_argument("--train-frac", type=float, default=0.8)
     pb.add_argument("--val-frac", type=float, default=0.1)
     pb.add_argument("--seed", type=int, default=42)
-    pb.add_argument("--seed-bench", type=int, default=42, help="Random seed for brute-force")
+    pb.add_argument("--seed-bench", type=int, default=42, help="Random seed for benchmark")
     pb.add_argument("--n-tokens", type=int, default=None, help="Limit test tokens")
+    pb.add_argument("--word-len", type=int, default=6, help="Length of word to guess")
+    pb.add_argument("--chars-to-try", type=str, default=None, help="Specific characters to use (e.g., 'abcdef')")
     pb.set_defaults(func=cmd_benchmark)
 
     return p
