@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
-from typing import Optional
+import time
+from typing import Dict, Optional, Tuple
 
 from .data import TextPrepConfig, build_alphabet, load_text, normalize_text, split_text
 from .metrics import cross_entropy_and_accuracy, perplexity
@@ -82,6 +84,113 @@ def cmd_probs(args: argparse.Namespace) -> None:
         print(f"{safe}\t{p:.6f}")
 
 
+def cmd_benchmark(args: argparse.Namespace) -> None:
+    """Benchmark Markov model vs brute-force (uniform baseline) and report metrics."""
+    import random
+    model = CharMarkovModel.load(args.model)
+    raw = load_text(args.input)
+    prep_cfg = TextPrepConfig(
+        lowercase=model.lowercase,
+        keep_whitespace=True,
+        keep_punctuation=True,
+        allowed_extra_chars="\n\t\r",
+    )
+    text = normalize_text(raw, prep_cfg)
+    _, _, test = split_text(text, train_frac=args.train_frac, val_frac=args.val_frac, seed=args.seed)
+
+    # Prune test to requested n if specified
+    if args.n_tokens is not None and args.n_tokens < len(test):
+        test = test[:args.n_tokens]
+
+    n_tokens = len(test) - model.order_k
+    if n_tokens <= 0:
+        print("Error: insufficient test data")
+        return
+
+    # Build brute-force baseline: uniform probabilities
+    alphabet = model.alphabet
+    V = len(alphabet)
+
+    # Benchmark Markov
+    t0 = time.perf_counter()
+    markov_correct = 0
+    markov_ce_sum = 0.0
+    markov_dist_count = 0
+    for i in range(model.order_k, len(test)):
+        history = test[i - model.order_k : i]
+        true_ch = test[i]
+        dist = model.next_distribution(history)
+        p_true = max(1e-12, dist.get(true_ch, 0.0))
+        markov_ce_sum += -math.log2(p_true) if p_true > 1e-12 else 20.0
+        markov_dist_count += 1
+        pred = model.predict_next(history)
+        if pred == true_ch:
+            markov_correct += 1
+    t_markov = time.perf_counter() - t0
+
+    # Benchmark brute-force (uniform sampling)
+    random.seed(args.seed_bench)
+    t0 = time.perf_counter()
+    bf_correct = 0
+    bf_ce_sum = 0.0
+    uniform_prob = 1.0 / V
+    uniform_ce = -math.log2(uniform_prob)
+    for i in range(model.order_k, len(test)):
+        history = test[i - model.order_k : i]
+        true_ch = test[i]
+        # Always uniform; no context
+        p_true = uniform_prob
+        bf_ce_sum += uniform_ce
+        pred = random.choice(alphabet)
+        if pred == true_ch:
+            bf_correct += 1
+    t_bf = time.perf_counter() - t0
+
+    # Metrics
+    markov_acc = markov_correct / n_tokens if n_tokens > 0 else 0.0
+    bf_acc = bf_correct / n_tokens if n_tokens > 0 else 0.0
+    markov_ce = markov_ce_sum / markov_dist_count if markov_dist_count > 0 else float("inf")
+    bf_ce = bf_ce_sum / n_tokens if n_tokens > 0 else float("inf")
+    markov_ppl = perplexity(markov_ce)
+    bf_ppl = perplexity(bf_ce)
+
+    # Search space reduction: effective alphabet size from entropy
+    markov_eff_v = 2 ** (markov_ce / 1.442695)
+    bf_eff_v = V
+    reduction = 1.0 - (markov_eff_v / bf_eff_v) if bf_eff_v > 0 else 0.0
+
+    # Speedup
+    speedup = t_bf / t_markov if t_markov > 0 else 0.0
+
+    # Output
+    print("=" * 70)
+    print("BENCHMARK: Markov Chain vs Brute-Force (Uniform Baseline)")
+    print("=" * 70)
+    print(f"\nTest configuration:")
+    print(f"  Tokens: {n_tokens}")
+    print(f"  Alphabet size: {V}")
+    print(f"  Model order: {model.order_k}")
+    print(f"  Using Witten-Bell: {model.use_witten_bell}")
+    print(f"\n{'Metric':<25} {'Markov':>15} {'Brute-Force':>15} {'Improvement':>15}")
+    print("-" * 70)
+    print(f"{'Accuracy':<25} {markov_acc:>15.4%} {bf_acc:>15.4%} {(markov_acc / bf_acc - 1.0) * 100 if bf_acc > 0 else 0:>14.1f}%")
+    print(f"{'Cross-Entropy (bits)':<25} {markov_ce:>15.4f} {bf_ce:>15.4f} {((bf_ce / markov_ce - 1.0) * 100) if markov_ce > 0 else 0:>14.1f}%")
+    print(f"{'Perplexity':<25} {markov_ppl:>15.2f} {bf_ppl:>15.2f} {((bf_ppl / markov_ppl - 1.0) * 100) if markov_ppl > 0 else 0:>14.1f}%")
+    print(f"{'Prediction time (s)':<25} {t_markov:>15.6f} {t_bf:>15.6f} {speedup:>14.2f}x")
+    print(f"{'Pred rate (tok/s)':<25} {n_tokens / t_markov if t_markov > 0 else 0:>15.0f} {n_tokens / t_bf if t_bf > 0 else 0:>15.0f} {speedup:>14.2f}x")
+    print("-" * 70)
+    print(f"\nSearch space reduction:")
+    print(f"  Effective alphabet (Markov): {markov_eff_v:.2f}")
+    print(f"  Effective alphabet (Uniform): {bf_eff_v:.2f}")
+    print(f"  Reduction: {reduction:.1%}")
+    print(f"\nInterpretation:")
+    print(f"  • Markov model reduces effective search space by {reduction:.1%}")
+    print(f"  • Accuracy improves by {(markov_acc / bf_acc - 1.0) * 100 if bf_acc > 0 else 0:.1f}% vs uniform baseline")
+    print(f"  • Perplexity {(bf_ppl / markov_ppl - 1.0) * 100 if markov_ppl > 0 else 0:.1f}% lower (lower is better)")
+    print(f"  • Prediction time: {t_markov*1000:.2f}ms total for {n_tokens} tokens")
+    print("=" * 70)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Character-level Markov chain for next-char prediction")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -122,6 +231,16 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--context", required=True, help="History/context string")
     pp.add_argument("--topk", type=int, default=20)
     pp.set_defaults(func=cmd_probs)
+
+    pb = sub.add_parser("benchmark", help="Compare Markov vs brute-force baseline")
+    pb.add_argument("--model", required=True)
+    pb.add_argument("--input", required=True)
+    pb.add_argument("--train-frac", type=float, default=0.8)
+    pb.add_argument("--val-frac", type=float, default=0.1)
+    pb.add_argument("--seed", type=int, default=42)
+    pb.add_argument("--seed-bench", type=int, default=42, help="Random seed for brute-force")
+    pb.add_argument("--n-tokens", type=int, default=None, help="Limit test tokens")
+    pb.set_defaults(func=cmd_benchmark)
 
     return p
 

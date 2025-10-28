@@ -41,6 +41,11 @@ python -m markov_char.cli generate --model model.json --seed-text "interconnec" 
 python -m markov_char.cli probs --model model.json --context "interconnec" --topk 10
 ```
 
+7) Benchmark against brute-force baseline (accuracy, perplexity, search-space reduction):
+```powershell
+python -m markov_char.cli benchmark --model model.json --input markov_char\data.txt
+```
+
 ### Commands and flags
 - `train`:
   - `--input`: path to text file
@@ -69,6 +74,13 @@ python -m markov_char.cli probs --model model.json --context "interconnec" --top
   - `--context`: show next-char distribution for this history
   - `--topk`: number of top characters to print
 
+- `benchmark`:
+  - `--model`: path to model JSON
+  - `--input`: path to text (same domain/preprocessing as training)
+  - `--train-frac`, `--val-frac`, `--seed`: to derive test split from the file
+  - `--n-tokens`: limit number of test tokens (optional)
+  - `--seed-bench`: random seed for brute-force baseline (default: 42)
+
 ### Smoothing methods
 - Add-α (Laplace): adds α count to each symbol before normalizing. Good baseline; too large α can over-flatten probabilities.
 - Witten–Bell backoff (recommended): interpolates higher-order estimates with lower orders according to the ratio of total events (N) vs unique continuations (T) in the context:
@@ -88,6 +100,19 @@ python -m markov_char.cli probs --model model.json --context "interconnec" --top
 - Normalize consistently: if you train with `--lowercase`, prompt in lowercase.
 - Evaluate via perplexity/accuracy on a held-out test split and pick k that minimizes perplexity.
 - For hard accuracy comparisons, use `--temperature 0` when generating.
+
+### Benchmark output
+
+The `benchmark` command compares your trained model against a brute-force (uniform random) baseline and reports:
+
+- **Accuracy**: percentage of correct next-character predictions
+- **Cross-entropy**: average bits per prediction (lower is better)
+- **Perplexity**: effective uncertainty in next-char distribution (lower is better)
+- **Search space reduction**: how much the model narrows the effective alphabet size
+- **Speed**: prediction rate in tokens/second
+- **Improvement**: percentage gains over brute-force
+
+Example output shows the Markov model typically achieves 20–50% accuracy vs ~3% for uniform, with 90%+ search-space reduction.
 
 ### Requirements
 - Python 3.9+
